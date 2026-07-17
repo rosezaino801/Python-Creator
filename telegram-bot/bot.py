@@ -5,13 +5,13 @@ A clean, well-commented bot using python-telegram-bot v20+.
 
 - Inline keyboard with Products, Prices, Contact Support, About Us buttons.
 - Any free-text message (not a command or button press) is forwarded to
-  OpenAI and the AI's reply is sent back to the user.
+  Google Gemini and the AI's reply is sent back to the user.
 """
 
 import logging
 import os
 
-from openai import AsyncOpenAI
+from google import genai
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -32,10 +32,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# OpenAI client
+# Gemini client
 # ---------------------------------------------------------------------------
-# AsyncOpenAI reads OPENAI_API_KEY from the environment automatically.
-openai_client = AsyncOpenAI()
+# The client reads GEMINI_API_KEY from the environment automatically.
+gemini_client = genai.Client()
+
+# Model to use — gemini-2.0-flash is fast, capable, and cost-efficient.
+GEMINI_MODEL = "gemini-2.0-flash"
 
 # System prompt that shapes how the AI responds inside this support bot.
 SYSTEM_PROMPT = (
@@ -184,40 +187,40 @@ async def handle_about_us(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ---------------------------------------------------------------------------
-# AI fallback handler
+# Gemini AI fallback handler
 # ---------------------------------------------------------------------------
 
 async def handle_ai_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Handles any free-text message that isn't a command or button press.
-    Sends the user's message to OpenAI and replies with the AI's response.
+    Sends the user's message to Google Gemini and replies with the AI's response.
     """
     user_text = update.message.text
 
-    # Show a typing indicator while we wait for the OpenAI response.
+    # Show a typing indicator while waiting for the Gemini response.
     await update.message.chat.send_action("typing")
 
     try:
-        response = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user",   "content": user_text},
-            ],
-            max_tokens=1024,
+        response = await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=user_text,
+            config=genai.types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                max_output_tokens=1024,
+            ),
         )
 
-        ai_reply = response.choices[0].message.content.strip()
-        logger.info("OpenAI replied (%d chars) to: %s", len(ai_reply), user_text[:60])
+        ai_reply = response.text.strip()
+        logger.info("Gemini replied (%d chars) to: %s", len(ai_reply), user_text[:60])
 
     except Exception as exc:
-        logger.error("OpenAI request failed: %s", exc)
+        logger.error("Gemini request failed: %s", exc)
         ai_reply = (
             "⚠️ Sorry, I couldn't reach the AI right now. "
             "Please try again in a moment, or tap a button below for quick help."
         )
 
-    # Send the AI reply and keep the inline menu visible.
+    # Send the Gemini reply and keep the inline menu visible.
     await update.message.reply_text(ai_reply, reply_markup=MAIN_KEYBOARD)
 
 
@@ -235,9 +238,9 @@ def main() -> None:
             "Add it in the Replit Secrets panel."
         )
 
-    if not os.environ.get("OPENAI_API_KEY"):
+    if not os.environ.get("GEMINI_API_KEY"):
         raise RuntimeError(
-            "OPENAI_API_KEY environment variable is not set. "
+            "GEMINI_API_KEY environment variable is not set. "
             "Add it in the Replit Secrets panel."
         )
 
@@ -253,9 +256,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_contact_support, pattern="^contact_support$"))
     app.add_handler(CallbackQueryHandler(handle_about_us,        pattern="^about_us$"))
 
-    # --- AI fallback: any text that isn't a command goes to OpenAI ---
-    # This handler runs AFTER all the above, so button presses are never
-    # caught here (they arrive as CallbackQuery updates, not text messages).
+    # --- Gemini fallback: any text that isn't a command goes to Gemini ---
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_message))
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
