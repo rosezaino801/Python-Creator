@@ -1,26 +1,30 @@
 """
-Muhammed Fashion Store — Shopping Bot with Admin Panel
-=======================================================
+Muhammed Fashion Store — Shopping Bot with Admin Panel & Order System
+=====================================================================
 python-telegram-bot v20+  |  Google Gemini AI  |  products.json catalog
 
 Customer flow
 ─────────────
   /start  → store banner + main menu (photo message, edited in-place)
   Browse Products → category grid → product carousel (◀ ▶)
-  Buy Now → order instructions (new reply)
+  Order Now → guided checkout (name → phone → address → qty → notes → confirm)
   Contact Us → contact details
+
+Order flow
+──────────
+  Tap "🛒 Order Now" on any product
+  → Full Name → Phone Number → Delivery Address → Quantity → Notes (optional)
+  → Order summary shown for confirmation
+  → On confirm: order saved to orders.json, admin notified, customer gets receipt
 
 Admin panel  (owner only, gated by ADMIN_CHAT_ID)
 ──────────────────────────────────────────────────
-  /admin  → Admin Main Menu
-    ├── 📦 Manage Products
-    │     ├── ➕ Add Product    (category → name → description → price → photo)
-    │     ├── ✏️ Edit Product   (category → product → field → new value/photo)
-    │     └── 🗑️ Delete Product (category → product → confirm)
-    └── 🏪 Store Settings      (name / Gmail / WhatsApp)
+  /admin → Admin Main Menu
+    ├── 📦 Manage Products  (add / edit / delete)
+    └── 🏪 Store Settings   (name / Gmail / WhatsApp)
 
-All changes are written to products.json and hot-reloaded into memory
-immediately — customers see updates without any bot restart.
+All catalog changes are written to products.json and hot-reloaded immediately.
+All orders are appended to orders.json.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import logging
 import os
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from google import genai
@@ -64,7 +69,6 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────────────────────
 PRODUCTS_FILE = Path(__file__).parent / "products.json"
 
-# Module-level globals updated by reload_catalog()
 STORE:   dict = {}
 CATS:    list = []
 CAT_MAP: dict = {}
@@ -76,7 +80,6 @@ def load_catalog() -> dict:
 
 
 def reload_catalog() -> None:
-    """Re-read products.json and refresh all in-memory catalog globals."""
     global STORE, CATS, CAT_MAP
     data    = load_catalog()
     STORE   = data["store"]
@@ -90,7 +93,6 @@ def reload_catalog() -> None:
 
 
 def save_catalog() -> None:
-    """Persist the current in-memory catalog to products.json, then reload."""
     data = {"store": STORE, "categories": CATS}
     with open(PRODUCTS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -98,8 +100,33 @@ def save_catalog() -> None:
     logger.info("Catalog saved to %s", PRODUCTS_FILE)
 
 
-# Initial load at startup
-reload_catalog()
+reload_catalog()   # initial load at startup
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Orders — persisted to orders.json
+# ─────────────────────────────────────────────────────────────────────────────
+ORDERS_FILE = Path(__file__).parent / "orders.json"
+
+
+def load_orders() -> dict:
+    if not ORDERS_FILE.exists():
+        return {"orders": []}
+    with open(ORDERS_FILE, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_order(order: dict) -> str:
+    """Append one order to orders.json and return its order_id."""
+    data = load_orders()
+    data["orders"].append(order)
+    with open(ORDERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    logger.info("Order saved: %s", order["order_id"])
+    return order["order_id"]
+
+
+def _new_order_id() -> str:
+    return f"ORD-{int(time.time())}"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Gemini AI client
@@ -119,7 +146,7 @@ def build_system_prompt() -> str:
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Admin config
+# Admin config & notifications
 # ─────────────────────────────────────────────────────────────────────────────
 _raw = os.environ.get("ADMIN_CHAT_ID", "").strip()
 ADMIN_CHAT_ID: int | None = int(_raw) if _raw.lstrip("-").isdigit() else None
@@ -127,7 +154,7 @@ ADMIN_CHAT_ID: int | None = int(_raw) if _raw.lstrip("-").isdigit() else None
 if ADMIN_CHAT_ID:
     logger.info("Admin panel enabled for chat ID %d", ADMIN_CHAT_ID)
 else:
-    logger.warning("ADMIN_CHAT_ID not set — admin panel is disabled.")
+    logger.warning("ADMIN_CHAT_ID not set — admin panel and order alerts are disabled.")
 
 
 def is_admin(update: Update) -> bool:
@@ -159,9 +186,43 @@ async def notify_admin(
     except Exception as exc:
         logger.error("Admin notification failed: %s", exc)
 
+
+async def send_order_to_admin(context: ContextTypes.DEFAULT_TYPE, order: dict) -> None:
+    """Send a fully formatted new-order card to the admin."""
+    if not ADMIN_CHAT_ID:
+        return
+    c   = order["customer"]
+    p   = order["product"]
+    qty = order["quantity"]
+    notes_line = f"\n💬 *Notes:* {order['notes']}" if order.get("notes") else ""
+    text = (
+        f"🆕 *NEW ORDER — {order['order_id']}*\n"
+        f"🕐 {order['timestamp']}\n"
+        f"{'─' * 28}\n\n"
+        f"🛍️ *Product:* {p['name']}\n"
+        f"📂 *Category:* {p['category']}\n"
+        f"🔢 *Quantity:* {qty}\n"
+        f"💰 *Unit Price:* {_fmt_price(p['unit_price'])}\n"
+        f"💵 *Total:* {_fmt_price(order['total_price'])}\n"
+        f"{'─' * 28}\n\n"
+        f"👤 *Customer:* {c['full_name']}\n"
+        f"📞 *Phone:* {c['phone']}\n"
+        f"🏠 *Address:* {c['address']}\n"
+        f"🆔 *Telegram:* {c['telegram_username']} (`{c['telegram_id']}`)"
+        f"{notes_line}"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID, text=text, parse_mode="Markdown"
+        )
+    except Exception as exc:
+        logger.error("Failed to send order to admin: %s", exc)
+
 # ─────────────────────────────────────────────────────────────────────────────
-# ConversationHandler states  (admin panel)
+# ConversationHandler state constants
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Admin panel states  (0 – 15)
 (
     ADMIN_MAIN,
     ADD_CAT, ADD_NAME, ADD_DESC, ADD_PRICE, ADD_PHOTO,
@@ -170,8 +231,18 @@ async def notify_admin(
     SETTINGS_FIELD, SETTINGS_VAL,
 ) = range(16)
 
+# Order flow states  (100 – 105)  — no overlap with admin states
+(
+    ORD_NAME,
+    ORD_PHONE,
+    ORD_ADDRESS,
+    ORD_QTY,
+    ORD_NOTES,
+    ORD_CONFIRM,
+) = range(100, 106)
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Shared helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fmt_price(price: int) -> str:
@@ -182,7 +253,7 @@ def _new_prod_id(cat_id: str) -> str:
     return f"{cat_id}_{int(time.time())}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ── CUSTOMER UI ──────────────────────────────────────────────────────────────
+# ── CUSTOMER UI  ─────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
 def home_keyboard() -> InlineKeyboardMarkup:
@@ -214,7 +285,7 @@ def product_keyboard(cat_id: str, idx: int, total: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("◀ Prev", callback_data=f"nav:{cat_id}:{(idx-1)%total}"),
             InlineKeyboardButton("Next ▶", callback_data=f"nav:{cat_id}:{(idx+1)%total}"),
         ])
-    rows.append([InlineKeyboardButton("🛒 Buy Now", callback_data=f"buy:{cat_id}:{idx}")])
+    rows.append([InlineKeyboardButton("🛒 Order Now", callback_data=f"ord:{cat_id}:{idx}")])
     rows.append([
         InlineKeyboardButton("🔙 Categories", callback_data="cats"),
         InlineKeyboardButton("🏠 Home",       callback_data="home"),
@@ -229,11 +300,10 @@ def contact_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def after_buy_keyboard(cat_id: str, idx: int) -> InlineKeyboardMarkup:
+def after_order_keyboard(cat_id: str, idx: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 Back to Product", callback_data=f"nav:{cat_id}:{idx}")],
-        [InlineKeyboardButton("🛍️ Browse More",    callback_data="cats")],
-        [InlineKeyboardButton("🏠 Home",            callback_data="home")],
+        [InlineKeyboardButton("🛍️ Continue Shopping", callback_data="cats")],
+        [InlineKeyboardButton("🏠 Home",               callback_data="home")],
     ])
 
 
@@ -276,25 +346,10 @@ def contact_caption() -> str:
     return "\n".join(lines)
 
 
-def order_caption(product: dict, cat_id: str) -> str:
-    email        = STORE.get("contact_email", "")
-    whatsapp     = STORE.get("contact_whatsapp", "")
-    instructions = STORE.get("order_instructions", "Contact us to place your order.")
-    text = (
-        f"🛒 *Place Your Order*\n\n"
-        f"*Product:* {product['name']}\n"
-        f"*Price:* {_fmt_price(product['price'])}\n\n"
-        f"{instructions}\n\n"
-    )
-    if email:    text += f"📧 *Email:* {email}\n"
-    if whatsapp: text += f"💬 *WhatsApp:* {whatsapp}\n"
-    return text
-
-
 async def _render_photo(
     q, photo_url: str, caption: str, keyboard: InlineKeyboardMarkup
 ) -> None:
-    """Edit the catalog message in-place, or replace it if it was a text message."""
+    """Edit the catalog message in-place, or replace it cleanly if it was plain text."""
     media = InputMediaPhoto(media=photo_url, caption=caption, parse_mode="Markdown")
     if q.message.photo:
         await q.edit_message_media(media=media, reply_markup=keyboard)
@@ -330,9 +385,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         f"ℹ️ *{STORE['name']} — Help*\n\n"
         "Commands:\n"
-        "/start — Open the store\n"
-        "/help  — Show this message\n"
-        "/myid  — Show your Telegram user ID\n\n"
+        "/start  — Open the store\n"
+        "/help   — Show this message\n"
+        "/myid   — Show your Telegram user ID\n"
+        "/cancel — Cancel the current order form\n\n"
         "Use the buttons to browse and order. "
         "Or just *type a question* and our AI will answer it 🤖",
         parse_mode="Markdown",
@@ -396,23 +452,261 @@ async def cb_navigate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await _render_photo(q, p["image_url"], product_caption(cat, p, idx),
                         product_keyboard(cat_id, idx, len(products)))
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ── ORDER CONVERSATION FLOW ───────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry: customer taps "🛒 Order Now" on any product (callback_data "ord:{cat}:{idx}")
+# Steps: name → phone → address → quantity → notes (optional) → confirm → done
+# ─────────────────────────────────────────────────────────────────────────────
 
-async def cb_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+_CANCEL_KB = InlineKeyboardMarkup([[
+    InlineKeyboardButton("❌ Cancel Order", callback_data="ord_cancel"),
+]])
+
+_NOTES_KB = InlineKeyboardMarkup([[
+    InlineKeyboardButton("⏭️ Skip — no special notes", callback_data="ord_skip"),
+], [
+    InlineKeyboardButton("❌ Cancel Order", callback_data="ord_cancel"),
+]])
+
+
+async def ord_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Entry point: customer tapped 'Order Now' on a product."""
     q              = update.callback_query
     _, cat_id, raw = q.data.split(":")
     idx            = int(raw)
     cat            = CAT_MAP.get(cat_id)
     if not cat or idx >= len(cat["products"]):
-        await q.answer("Product not found.", show_alert=True); return
-    p = cat["products"][idx]
-    await q.answer("📦 Order details sent below!")
+        await q.answer("Product not found.", show_alert=True)
+        return ConversationHandler.END
+
+    product = cat["products"][idx]
+    await q.answer()
     await notify_admin(context, q.from_user,
-                       f"🛒 Buy Now — {p['name']} ({_fmt_price(p['price'])})")
+                       f"🛒 Started order: {product['name']} ({_fmt_price(product['price'])})")
+
+    # Store everything needed to build the order later
+    context.user_data["order"] = {
+        "cat_id":     cat_id,
+        "prod_idx":   idx,
+        "prod_name":  product["name"],
+        "cat_name":   cat["name"],
+        "unit_price": product["price"],
+    }
+
     await q.message.reply_text(
-        order_caption(p, cat_id),
+        f"🛒 *Order: {product['name']}*\n"
+        f"💰 *Price: {_fmt_price(product['price'])}* per item\n\n"
+        f"Let's collect your delivery details.\n\n"
+        f"*Step 1 of 5* — What is your *full name?*",
         parse_mode="Markdown",
-        reply_markup=after_buy_keyboard(cat_id, idx),
+        reply_markup=_CANCEL_KB,
     )
+    return ORD_NAME
+
+
+async def ord_get_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    name = update.message.text.strip()
+    if len(name) < 2:
+        await update.message.reply_text(
+            "Please enter your *full name* (at least 2 characters).",
+            parse_mode="Markdown", reply_markup=_CANCEL_KB,
+        )
+        return ORD_NAME
+
+    context.user_data["order"]["full_name"] = name
+    await update.message.reply_text(
+        f"✅ Hi, *{name}*!\n\n"
+        f"*Step 2 of 5* — What is your *phone number?*\n"
+        f"_(We will use this to contact you about your order.)_",
+        parse_mode="Markdown",
+        reply_markup=_CANCEL_KB,
+    )
+    return ORD_PHONE
+
+
+async def ord_get_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    phone = update.message.text.strip()
+    # Accept Nigerian formats: 08xxxxxxxxx, +2348xxxxxxxxx, 2348xxxxxxxxx, etc.
+    digits = re.sub(r"[\s\-\(\)]", "", phone)
+    if not re.match(r"^(\+?234|0)\d{9,10}$", digits) and len(digits) < 7:
+        await update.message.reply_text(
+            "❌ That doesn't look like a valid phone number. Please try again.",
+            reply_markup=_CANCEL_KB,
+        )
+        return ORD_PHONE
+
+    context.user_data["order"]["phone"] = phone
+    await update.message.reply_text(
+        f"*Step 3 of 5* — What is your *delivery address?*\n"
+        f"_(Include your street, city, and state.)_",
+        parse_mode="Markdown",
+        reply_markup=_CANCEL_KB,
+    )
+    return ORD_ADDRESS
+
+
+async def ord_get_address(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    address = update.message.text.strip()
+    if len(address) < 5:
+        await update.message.reply_text(
+            "Please enter a *complete delivery address*.",
+            parse_mode="Markdown", reply_markup=_CANCEL_KB,
+        )
+        return ORD_ADDRESS
+
+    context.user_data["order"]["address"] = address
+    prod_name = context.user_data["order"]["prod_name"]
+    await update.message.reply_text(
+        f"*Step 4 of 5* — How many units of *{prod_name}* would you like to order?",
+        parse_mode="Markdown",
+        reply_markup=_CANCEL_KB,
+    )
+    return ORD_QTY
+
+
+async def ord_get_qty(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    raw = re.sub(r"[^\d]", "", update.message.text)
+    if not raw or int(raw) < 1:
+        await update.message.reply_text(
+            "❌ Please enter a valid quantity (e.g. 1, 2, 3).",
+            reply_markup=_CANCEL_KB,
+        )
+        return ORD_QTY
+
+    qty        = int(raw)
+    unit_price = context.user_data["order"]["unit_price"]
+    context.user_data["order"]["quantity"]    = qty
+    context.user_data["order"]["total_price"] = qty * unit_price
+
+    await update.message.reply_text(
+        f"*Step 5 of 5* — Any *special notes* for your order?\n\n"
+        f"_(e.g. preferred colour, size, delivery time, gift wrapping)_\n\n"
+        f"Or tap *Skip* if you have no special requests.",
+        parse_mode="Markdown",
+        reply_markup=_NOTES_KB,
+    )
+    return ORD_NOTES
+
+
+async def ord_get_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Customer typed their notes — proceed to confirmation."""
+    context.user_data["order"]["notes"] = update.message.text.strip()
+    return await _show_order_summary(update.message.reply_text, context)
+
+
+async def ord_skip_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Customer tapped Skip — proceed to confirmation with no notes."""
+    q = update.callback_query; await q.answer()
+    context.user_data["order"]["notes"] = ""
+    return await _show_order_summary(q.message.reply_text, context)
+
+
+async def ord_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Customer tapped Cancel during the order flow."""
+    q = update.callback_query; await q.answer()
+    context.user_data.pop("order", None)
+    await q.message.reply_text(
+        "❌ Order cancelled. Tap *Order Now* on any product to start again.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ Browse Products", callback_data="cats")],
+        ]),
+    )
+    return ConversationHandler.END
+
+
+async def ord_cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Customer typed /cancel during the order flow."""
+    context.user_data.pop("order", None)
+    await update.message.reply_text(
+        "❌ Order cancelled. Tap *Order Now* on any product to start again.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🛍️ Browse Products", callback_data="cats")],
+        ]),
+    )
+    return ConversationHandler.END
+
+
+async def _show_order_summary(reply_fn, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Build and send the order confirmation card. Returns ORD_CONFIRM state."""
+    o          = context.user_data["order"]
+    notes_line = f"\n💬 *Notes:* {o['notes']}" if o.get("notes") else ""
+    summary    = (
+        f"📋 *Order Summary*\n"
+        f"{'─' * 26}\n\n"
+        f"🛍️ *Product:* {o['prod_name']}\n"
+        f"📂 *Category:* {o['cat_name']}\n"
+        f"🔢 *Quantity:* {o['quantity']}\n"
+        f"💰 *Unit Price:* {_fmt_price(o['unit_price'])}\n"
+        f"💵 *Total:* {_fmt_price(o['total_price'])}\n"
+        f"{'─' * 26}\n\n"
+        f"👤 *Name:* {o['full_name']}\n"
+        f"📞 *Phone:* {o['phone']}\n"
+        f"🏠 *Address:* {o['address']}"
+        f"{notes_line}\n\n"
+        f"_Please confirm your order below._"
+    )
+    confirm_kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Confirm Order", callback_data="ord_confirm")],
+        [InlineKeyboardButton("❌ Cancel",        callback_data="ord_cancel")],
+    ])
+    await reply_fn(summary, parse_mode="Markdown", reply_markup=confirm_kb)
+    return ORD_CONFIRM
+
+
+async def ord_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Customer confirmed — save order, alert admin, send receipt."""
+    q   = update.callback_query; await q.answer("✅ Order placed!")
+    o   = context.user_data.get("order", {})
+    user = q.from_user
+
+    # Build the full order record
+    order = {
+        "order_id":    _new_order_id(),
+        "timestamp":   datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+        "status":      "pending",
+        "product": {
+            "name":       o["prod_name"],
+            "category":   o["cat_name"],
+            "unit_price": o["unit_price"],
+        },
+        "quantity":    o["quantity"],
+        "total_price": o["total_price"],
+        "notes":       o.get("notes", ""),
+        "customer": {
+            "telegram_id":       user.id,
+            "telegram_username": f"@{user.username}" if user.username else "—",
+            "full_name":         o["full_name"],
+            "phone":             o["phone"],
+            "address":           o["address"],
+        },
+    }
+
+    order_id = save_order(order)
+    await send_order_to_admin(context, order)
+
+    # Send receipt to customer
+    receipt = (
+        f"✅ *Order Confirmed!*\n\n"
+        f"Thank you, *{o['full_name']}*! Your order has been received.\n\n"
+        f"🛍️ *Product:* {o['prod_name']}\n"
+        f"🔢 *Quantity:* {o['quantity']}\n"
+        f"💵 *Total:* {_fmt_price(o['total_price'])}\n"
+        f"📋 *Order ID:* `{order_id}`\n\n"
+        f"We will contact you soon on *{o['phone']}* to confirm delivery details.\n\n"
+        f"_{STORE['name']} — Thank you for shopping with us! 🙏_"
+    )
+    await q.message.reply_text(
+        receipt,
+        parse_mode="Markdown",
+        reply_markup=after_order_keyboard(o.get("cat_id", ""), o.get("prod_idx", 0)),
+    )
+
+    logger.info("Order %s confirmed for %s", order_id, o["full_name"])
+    context.user_data.pop("order", None)
+    return ConversationHandler.END
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── GEMINI AI FALLBACK ────────────────────────────────────────────────────────
@@ -472,7 +766,6 @@ def _adm_products_kb() -> InlineKeyboardMarkup:
 
 
 def _adm_cats_kb(action: str) -> InlineKeyboardMarkup:
-    """Category selection — one per row."""
     rows = [
         [InlineKeyboardButton(f"{c['emoji']} {c['name']}",
                               callback_data=f"adm_cat:{action}:{c['id']}")]
@@ -507,7 +800,7 @@ def _adm_fields_kb(cat_id: str, idx: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("💰 Price",       callback_data=f"{base}:price"),
             InlineKeyboardButton("🖼️ Photo",       callback_data=f"{base}:photo"),
         ],
-        [InlineKeyboardButton("🔙 Back",            callback_data=f"adm_cat:edit:{cat_id}")],
+        [InlineKeyboardButton("🔙 Back", callback_data=f"adm_cat:edit:{cat_id}")],
     ])
 
 
@@ -521,12 +814,10 @@ def _adm_settings_kb() -> InlineKeyboardMarkup:
 
 
 def _adm_confirm_kb(yes_data: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Yes, delete", callback_data=f"adm_confirm:yes:{yes_data}"),
-            InlineKeyboardButton("❌ Cancel",      callback_data=f"adm_confirm:no"),
-        ],
-    ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, delete", callback_data=f"adm_confirm:yes:{yes_data}"),
+        InlineKeyboardButton("❌ Cancel",      callback_data=f"adm_confirm:no"),
+    ]])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── ADMIN PANEL — shared helpers ──────────────────────────────────────────────
@@ -538,7 +829,6 @@ def _adm_header() -> str:
 
 async def _adm_reply(update_or_q, text: str, keyboard: InlineKeyboardMarkup,
                      is_callback: bool = True) -> None:
-    """Send or edit a text message in the admin panel."""
     if is_callback:
         await update_or_q.edit_message_text(
             text, parse_mode="Markdown", reply_markup=keyboard
@@ -553,7 +843,6 @@ async def _adm_reply(update_or_q, text: str, keyboard: InlineKeyboardMarkup,
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def admin_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Entry point: /admin"""
     if not is_admin(update):
         await update.message.reply_text("⛔ Access denied.")
         return ConversationHandler.END
@@ -583,7 +872,7 @@ async def adm_show_products(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def adm_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q = update.callback_query; await q.answer()
     await q.edit_message_text(
-        "✅ Admin panel closed. Type /admin to reopen it or /start for the store.",
+        "✅ Admin panel closed. Type /admin to reopen or /start for the store.",
         reply_markup=None,
     )
     context.user_data.clear()
@@ -640,7 +929,7 @@ async def add_get_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     raw = re.sub(r"[^\d]", "", update.message.text)
     if not raw:
         await update.message.reply_text("❌ Please send numbers only (e.g. `25000`).",
-                                         parse_mode="Markdown")
+                                        parse_mode="Markdown")
         return ADD_PRICE
     context.user_data["new_prod"]["price"] = int(raw)
     await update.message.reply_text(
@@ -659,7 +948,6 @@ async def add_get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     if not cat:
         await update.message.reply_text("❌ Category not found. Start over with /admin.")
         return ConversationHandler.END
-
     new_product = {
         "id":          _new_prod_id(cat_id),
         "name":        np["name"],
@@ -669,7 +957,6 @@ async def add_get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     }
     cat["products"].append(new_product)
     save_catalog()
-
     await update.message.reply_text(
         f"✅ *{new_product['name']}* added to *{cat['name']}*!\n\n"
         f"Price: {_fmt_price(new_product['price'])}\n"
@@ -712,58 +999,52 @@ async def edit_select_cat(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 async def edit_select_prod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q              = update.callback_query; await q.answer()
+    q                 = update.callback_query; await q.answer()
     _, _, cat_id, raw = q.data.split(":", 3)
-    idx            = int(raw)
+    idx               = int(raw)
     context.user_data["edit_prod_idx"] = idx
     context.user_data["edit_cat"]      = cat_id
     cat  = CAT_MAP.get(cat_id, {})
     prod = cat.get("products", [])[idx]
     await _adm_reply(q,
         _adm_header() +
-        f"✏️ *Edit Product*\n\n"
-        f"*{prod['name']}*\n"
-        f"Price: {_fmt_price(prod['price'])}\n\n"
+        f"✏️ *Edit Product*\n\n*{prod['name']}*\nPrice: {_fmt_price(prod['price'])}\n\n"
         f"Which field would you like to change?",
         _adm_fields_kb(cat_id, idx))
     return EDIT_FIELD
 
 
 async def edit_select_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q    = update.callback_query; await q.answer()
-    # callback_data: adm_field:{cat_id}:{idx}:{field}
-    parts = q.data.split(":")          # ['adm_field', cat_id, idx, field]
+    q      = update.callback_query; await q.answer()
+    parts  = q.data.split(":")
     field  = parts[-1]
     cat_id = parts[1]
     idx    = int(parts[2])
     context.user_data["edit_field"]    = field
     context.user_data["edit_cat"]      = cat_id
     context.user_data["edit_prod_idx"] = idx
-
     if field == "photo":
         await _adm_reply(q,
             _adm_header() + "✏️ *Edit Product*\n\nUpload the new product photo:",
             InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"adm_prod:edit:{cat_id}:{idx}")]]))
         return EDIT_PHOTO
-    else:
-        labels = {"name": "product name", "desc": "description", "price": "price (numbers only)"}
-        await _adm_reply(q,
-            _adm_header() + f"✏️ *Edit Product*\n\nSend the new *{labels.get(field, field)}*:",
-            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"adm_prod:edit:{cat_id}:{idx}")]]))
-        return EDIT_VAL
+    labels = {"name": "product name", "desc": "description", "price": "price (numbers only)"}
+    await _adm_reply(q,
+        _adm_header() + f"✏️ *Edit Product*\n\nSend the new *{labels.get(field, field)}*:",
+        InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data=f"adm_prod:edit:{cat_id}:{idx}")]]))
+    return EDIT_VAL
 
 
 async def edit_get_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    field   = context.user_data.get("edit_field")
-    cat_id  = context.user_data.get("edit_cat")
-    idx     = context.user_data.get("edit_prod_idx", 0)
-    cat     = CAT_MAP.get(cat_id)
+    field  = context.user_data.get("edit_field")
+    cat_id = context.user_data.get("edit_cat")
+    idx    = context.user_data.get("edit_prod_idx", 0)
+    cat    = CAT_MAP.get(cat_id)
     if not cat:
-        await update.message.reply_text("❌ Session expired. Run /admin again."); return ConversationHandler.END
-
+        await update.message.reply_text("❌ Session expired. Run /admin again.")
+        return ConversationHandler.END
     prod = cat["products"][idx]
     text = update.message.text.strip()
-
     if field == "price":
         raw = re.sub(r"[^\d]", "", text)
         if not raw:
@@ -774,10 +1055,9 @@ async def edit_get_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         prod["name"] = text
     elif field == "desc":
         prod["description"] = text
-
     save_catalog()
     await update.message.reply_text(
-        f"✅ *{prod['name']}* updated successfully! Customers see the change immediately.",
+        f"✅ *{prod['name']}* updated! Customers see the change immediately.",
         parse_mode="Markdown",
         reply_markup=_adm_main_kb(),
     )
@@ -790,10 +1070,10 @@ async def edit_get_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     idx    = context.user_data.get("edit_prod_idx", 0)
     cat    = CAT_MAP.get(cat_id)
     if not cat:
-        await update.message.reply_text("❌ Session expired. Run /admin again."); return ConversationHandler.END
-
-    prod               = cat["products"][idx]
-    prod["image_url"]  = update.message.photo[-1].file_id
+        await update.message.reply_text("❌ Session expired. Run /admin again.")
+        return ConversationHandler.END
+    prod              = cat["products"][idx]
+    prod["image_url"] = update.message.photo[-1].file_id
     save_catalog()
     await update.message.reply_text(
         f"✅ Photo updated for *{prod['name']}*! Customers see the change immediately.",
@@ -835,45 +1115,41 @@ async def del_select_cat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def del_select_prod(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q              = update.callback_query; await q.answer()
+    q                 = update.callback_query; await q.answer()
     _, _, cat_id, raw = q.data.split(":", 3)
-    idx            = int(raw)
-    cat            = CAT_MAP.get(cat_id)
-    prod           = cat["products"][idx]
+    idx               = int(raw)
+    cat               = CAT_MAP.get(cat_id)
+    prod              = cat["products"][idx]
     context.user_data["del_cat"]      = cat_id
     context.user_data["del_prod_idx"] = idx
     await _adm_reply(q,
         _adm_header() +
         f"🗑️ *Delete Product*\n\n"
         f"Are you sure you want to delete:\n\n"
-        f"*{prod['name']}*\n"
-        f"Price: {_fmt_price(prod['price'])}\n\n"
+        f"*{prod['name']}*\nPrice: {_fmt_price(prod['price'])}\n\n"
         f"⚠️ This cannot be undone.",
         _adm_confirm_kb(f"{cat_id}:{idx}"))
     return DEL_CONFIRM
 
 
 async def del_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    q     = update.callback_query; await q.answer()
-    parts = q.data.split(":")   # adm_confirm:yes:{cat_id}:{idx}  or  adm_confirm:no
+    q        = update.callback_query; await q.answer()
+    parts    = q.data.split(":")
     decision = parts[1]
-
     if decision == "no":
         await _adm_reply(q, _adm_header() + "Deletion cancelled.", _adm_main_kb())
         context.user_data.clear()
         return ADMIN_MAIN
-
-    cat_id = parts[2]
-    idx    = int(parts[3])
-    cat    = CAT_MAP.get(cat_id)
+    cat_id  = parts[2]
+    idx     = int(parts[3])
+    cat     = CAT_MAP.get(cat_id)
     if not cat or idx >= len(cat["products"]):
         await _adm_reply(q, "❌ Product not found.", _adm_main_kb())
         return ADMIN_MAIN
-
     removed = cat["products"].pop(idx)
     save_catalog()
     await _adm_reply(q,
-        _adm_header() + f"✅ *{removed['name']}* has been deleted. Catalog updated immediately.",
+        _adm_header() + f"✅ *{removed['name']}* deleted. Catalog updated immediately.",
         _adm_main_kb())
     context.user_data.clear()
     return ADMIN_MAIN
@@ -898,12 +1174,12 @@ async def adm_show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def settings_select_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     q     = update.callback_query; await q.answer()
-    field = q.data.split(":")[-1]    # name | email | whatsapp
+    field = q.data.split(":")[-1]
     context.user_data["settings_field"] = field
     labels = {
-        "name":      ("Store Name",    STORE.get("name", "")),
-        "email":     ("Gmail Address", STORE.get("contact_email", "")),
-        "whatsapp":  ("WhatsApp",      STORE.get("contact_whatsapp", "")),
+        "name":     ("Store Name",    STORE.get("name", "")),
+        "email":    ("Gmail Address", STORE.get("contact_email", "")),
+        "whatsapp": ("WhatsApp",      STORE.get("contact_whatsapp", "")),
     }
     label, current = labels.get(field, (field, ""))
     await _adm_reply(q,
@@ -913,16 +1189,14 @@ async def settings_select_field(update: Update, context: ContextTypes.DEFAULT_TY
 
 
 async def settings_get_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    field = context.user_data.get("settings_field")
-    value = update.message.text.strip()
+    field    = context.user_data.get("settings_field")
+    value    = update.message.text.strip()
     if not value:
         await update.message.reply_text("❌ Value cannot be empty."); return SETTINGS_VAL
-
     field_map = {"name": "name", "email": "contact_email", "whatsapp": "contact_whatsapp"}
     json_key  = field_map.get(field)
     if not json_key:
         await update.message.reply_text("❌ Unknown field."); return ConversationHandler.END
-
     STORE[json_key] = value
     save_catalog()
     await update.message.reply_text(
@@ -944,7 +1218,46 @@ def main() -> None:
 
     app = Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"]).build()
 
-    # ── Admin ConversationHandler (registered first for priority) ────────────
+    # ── Order ConversationHandler (registered first — highest priority) ───────
+    order_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(ord_entry, pattern=r"^ord:[^:]+:\d+$"),
+        ],
+        states={
+            ORD_NAME: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ord_get_name),
+                CallbackQueryHandler(ord_cancel_cb, pattern=r"^ord_cancel$"),
+            ],
+            ORD_PHONE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ord_get_phone),
+                CallbackQueryHandler(ord_cancel_cb, pattern=r"^ord_cancel$"),
+            ],
+            ORD_ADDRESS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ord_get_address),
+                CallbackQueryHandler(ord_cancel_cb, pattern=r"^ord_cancel$"),
+            ],
+            ORD_QTY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ord_get_qty),
+                CallbackQueryHandler(ord_cancel_cb, pattern=r"^ord_cancel$"),
+            ],
+            ORD_NOTES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ord_get_notes),
+                CallbackQueryHandler(ord_skip_notes, pattern=r"^ord_skip$"),
+                CallbackQueryHandler(ord_cancel_cb,  pattern=r"^ord_cancel$"),
+            ],
+            ORD_CONFIRM: [
+                CallbackQueryHandler(ord_confirm,   pattern=r"^ord_confirm$"),
+                CallbackQueryHandler(ord_cancel_cb, pattern=r"^ord_cancel$"),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", ord_cancel_cmd)],
+        allow_reentry=True,
+        per_message=False,
+        name="order_flow",
+    )
+    app.add_handler(order_conv)
+
+    # ── Admin ConversationHandler ─────────────────────────────────────────────
     admin_conv = ConversationHandler(
         entry_points=[CommandHandler("admin", admin_start)],
         states={
@@ -961,15 +1274,9 @@ def main() -> None:
                 CallbackQueryHandler(add_select_cat,    pattern=r"^adm_cat:add:"),
                 CallbackQueryHandler(adm_show_products, pattern=r"^adm:products$"),
             ],
-            ADD_NAME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_name),
-            ],
-            ADD_DESC: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_desc),
-            ],
-            ADD_PRICE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_price),
-            ],
+            ADD_NAME:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_name)],
+            ADD_DESC:  [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_desc)],
+            ADD_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_get_price)],
             ADD_PHOTO: [
                 MessageHandler(filters.PHOTO,                   add_get_photo),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_photo_prompt),
@@ -1004,7 +1311,7 @@ def main() -> None:
                 CallbackQueryHandler(adm_start_del,     pattern=r"^adm:del$"),
             ],
             DEL_CONFIRM: [
-                CallbackQueryHandler(del_confirm,       pattern=r"^adm_confirm:"),
+                CallbackQueryHandler(del_confirm, pattern=r"^adm_confirm:"),
             ],
             SETTINGS_FIELD: [
                 CallbackQueryHandler(settings_select_field, pattern=r"^adm_setting:"),
@@ -1017,7 +1324,7 @@ def main() -> None:
         },
         fallbacks=[
             CommandHandler("cancel", admin_cancel),
-            CommandHandler("admin",  admin_start),   # allow re-entry at any time
+            CommandHandler("admin",  admin_start),
         ],
         allow_reentry=True,
         per_message=False,
@@ -1036,9 +1343,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(cb_contact,  pattern=r"^contact$"))
     app.add_handler(CallbackQueryHandler(cb_category, pattern=r"^cat:.+$"))
     app.add_handler(CallbackQueryHandler(cb_navigate, pattern=r"^nav:.+:\d+$"))
-    app.add_handler(CallbackQueryHandler(cb_buy,      pattern=r"^buy:.+:\d+$"))
 
-    # ── Gemini AI fallback for free-text messages ────────────────────────────
+    # ── Gemini AI fallback ────────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_message))
 
     logger.info("Bot is running. Press Ctrl+C to stop.")

@@ -27,6 +27,13 @@
           "description": "Compact and stylish top-handle bag crafted from soft pebbled leather. Features an adjustable strap and gold-tone hardware. Perfect for evenings and everyday carry.",
           "price": 28000,
           "image_url": "https://images.unsplash.com/photo-1584917865442-de89df76afd3?w=800&q=80"
+        },
+        {
+          "id": "leather_bags_1784303176",
+          "name": "Hi",
+          "description": "Short trouser",
+          "price": 1500,
+          "image_url": "AgACAgQAAxkBAANAalpOSJGR3eJSklIvv3X62w3NapoAAnINaxvhCtlSSWXezJydVL0BAAMCAAN5AAM9BA"
         }
       ]
     },
