@@ -1348,7 +1348,11 @@ def main() -> None:
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_message))
 
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # drop_pending_updates=True tells Telegram to discard any queued updates
+    # from a previous instance, which immediately evicts any stale polling
+    # session and resolves "Conflict: terminated by other getUpdates request"
+    # caused by Render's zero-downtime deploy overlap.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
