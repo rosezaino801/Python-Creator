@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: muhammed-fashion-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    healthCheckPath: /
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false          # set manually in Render dashboard
+      - key: GEMINI_API_KEY
+        sync: false          # set manually in Render dashboard
