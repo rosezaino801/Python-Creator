@@ -1317,7 +1317,13 @@ async def global_error_handler(
 # ── MAIN ─────────────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def build_app() -> "Application":
+    """Build and return the configured Application without starting polling.
+
+    Separated from main() so that main.py can manage the event loop itself,
+    run the health-check server alongside the bot in a single asyncio loop,
+    and perform explicit webhook deletion before polling begins.
+    """
     for key in ("TELEGRAM_BOT_TOKEN", "GEMINI_API_KEY"):
         if not os.environ.get(key):
             raise RuntimeError(f"{key} is not set. Add it as an environment variable.")
@@ -1459,11 +1465,18 @@ def main() -> None:
     # ── Gemini AI fallback ────────────────────────────────────────────────────
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ai_message))
 
+    return app
+
+
+def main() -> None:
+    """Entry point for local development (python telegram-bot/bot.py).
+
+    On Render, main.py calls build_app() directly so it can manage the event
+    loop, run the health-check server alongside the bot, and delete any
+    stale webhook before polling starts.
+    """
+    app = build_app()
     logger.info("Bot is running. Press Ctrl+C to stop.")
-    # drop_pending_updates=True tells Telegram to discard any queued updates
-    # from a previous instance, which immediately evicts any stale polling
-    # session and resolves "Conflict: terminated by other getUpdates request"
-    # caused by Render's zero-downtime deploy overlap.
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
